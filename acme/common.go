@@ -15,9 +15,10 @@ const (
 	IdentifierDNS = "dns"
 	IdentifierIP  = "ip"
 
-	ChallengeHTTP01    = "http-01"
-	ChallengeTLSALPN01 = "tls-alpn-01"
-	ChallengeDNS01     = "dns-01"
+	ChallengeHTTP01       = "http-01"
+	ChallengeTLSALPN01    = "tls-alpn-01"
+	ChallengeDNS01        = "dns-01"
+	ChallengeDNSAccount01 = "dns-account-01"
 
 	HTTP01BaseURL = ".well-known/acme-challenge/"
 
@@ -53,11 +54,15 @@ type Order struct {
 	Error          *ProblemDetails `json:"error,omitempty"`
 	Expires        string          `json:"expires"`
 	Identifiers    []Identifier    `json:"identifiers,omitempty"`
+	Profile        string          `json:"profile,omitempty"`
 	Finalize       string          `json:"finalize"`
 	NotBefore      string          `json:"notBefore,omitempty"`
 	NotAfter       string          `json:"notAfter,omitempty"`
 	Authorizations []string        `json:"authorizations"`
 	Certificate    string          `json:"certificate,omitempty"`
+
+	// https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari-03#section-5
+	Replaces string `json:"replaces,omitempty"`
 }
 
 // An Authorization is created for each identifier in an order

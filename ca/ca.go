@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -25,7 +27,7 @@ import (
 const (
 	rootCAPrefix          = "Pebble Root CA "
 	intermediateCAPrefix  = "Pebble Intermediate CA "
-	defaultValidityPeriod = 157766400
+	defaultValidityPeriod = 7776000
 )
 
 type CAImpl struct {
@@ -33,14 +35,18 @@ type CAImpl struct {
 	db               *db.MemoryStore
 	ocspResponderURL string
 
-	chains []*chain
-
-	certValidityPeriod uint64
+	chains   []*chain
+	profiles map[string]*Profile
 }
 
 type chain struct {
 	root          *issuer
 	intermediates []*issuer
+}
+
+type Profile struct {
+	Description    string
+	ValidityPeriod uint64
 }
 
 func (c *chain) String() string {
@@ -106,12 +112,12 @@ func makeKey() (*rsa.PrivateKey, []byte, error) {
 	return key, ski, nil
 }
 
-func (ca *CAImpl) makeRootCert(
+func (ca *CAImpl) makeCACert(
 	subjectKey crypto.Signer,
 	subject pkix.Name,
 	subjectKeyID []byte,
-	signer *issuer) (*core.Certificate, error) {
-
+	signer *issuer,
+) (*core.Certificate, error) {
 	serial := makeSerial()
 	template := &x509.Certificate{
 		Subject:      subject,
@@ -120,7 +126,7 @@ func (ca *CAImpl) makeRootCert(
 		NotAfter:     time.Now().AddDate(30, 0, 0),
 
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		SubjectKeyId:          subjectKeyID,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -173,7 +179,7 @@ func (ca *CAImpl) newRootIssuer(name string) (*issuer, error) {
 	subject := pkix.Name{
 		CommonName: rootCAPrefix + name,
 	}
-	rc, err := ca.makeRootCert(rk, subject, subjectKeyID, nil)
+	rc, err := ca.makeCACert(rk, subject, subjectKeyID, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -187,10 +193,10 @@ func (ca *CAImpl) newRootIssuer(name string) (*issuer, error) {
 
 func (ca *CAImpl) newIntermediateIssuer(root *issuer, intermediateKey crypto.Signer, subject pkix.Name, subjectKeyID []byte) (*issuer, error) {
 	if root == nil {
-		return nil, fmt.Errorf("Internal error: root must not be nil")
+		return nil, errors.New("internal error: root must not be nil")
 	}
 	// Make an intermediate certificate with the root issuer
-	ic, err := ca.makeRootCert(intermediateKey, subject, subjectKeyID, root)
+	ic, err := ca.makeCACert(intermediateKey, subject, subjectKeyID, root)
 	if err != nil {
 		return nil, err
 	}
@@ -251,23 +257,24 @@ func (ca *CAImpl) newChain(intermediateKey crypto.Signer, intermediateSubject pk
 	return c
 }
 
-func (ca *CAImpl) newCertificate(domains []string, ips []net.IP, key crypto.PublicKey, accountID, notBefore, notAfter string) (*core.Certificate, error) {
-	if len(domains) == 0 || len(ips) == 0 {
-		return nil, fmt.Errorf("must specify at least one domain name or IP address")
+func (ca *CAImpl) newCertificate(domains []string, ips []net.IP, key crypto.PublicKey, accountID, notBefore, notAfter, profileName string, extensions []pkix.Extension) (*core.Certificate, error) {
+	if len(domains) == 0 && len(ips) == 0 {
+		return nil, errors.New("must specify at least one domain name or IP address")
 	}
 
 	defaultChain := ca.chains[0].intermediates
 	if len(defaultChain) == 0 || defaultChain[0].cert == nil {
-		return nil, fmt.Errorf("cannot sign certificate - nil issuer")
+		return nil, errors.New("cannot sign certificate - nil issuer")
 	}
 	issuer := defaultChain[0]
 
-	subjectKeyID, err := makeSubjectKeyID(key)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create subject key ID: %s", err.Error())
+	prof, ok := ca.profiles[profileName]
+	if !ok {
+		return nil, fmt.Errorf("unrecgonized profile name %q", profileName)
 	}
 
 	certNotBefore := time.Now()
+	var err error
 	if notBefore != "" {
 		certNotBefore, err = time.Parse(time.RFC3339, notBefore)
 		if err != nil {
@@ -275,7 +282,7 @@ func (ca *CAImpl) newCertificate(domains []string, ips []net.IP, key crypto.Publ
 		}
 	}
 
-	certNotAfter := certNotBefore.Add(time.Duration(ca.certValidityPeriod-1) * time.Second)
+	certNotAfter := certNotBefore.Add(time.Duration(prof.ValidityPeriod-1) * time.Second)
 	maxNotAfter := time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
 	if certNotAfter.After(maxNotAfter) {
 		certNotAfter = maxNotAfter
@@ -295,9 +302,9 @@ func (ca *CAImpl) newCertificate(domains []string, ips []net.IP, key crypto.Publ
 		NotBefore:    certNotBefore,
 		NotAfter:     certNotAfter,
 
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		SubjectKeyId:          subjectKeyID,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtraExtensions:       extensions,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
@@ -339,11 +346,11 @@ func (ca *CAImpl) newCertificate(domains []string, ips []net.IP, key crypto.Publ
 	return newCert, nil
 }
 
-func New(log *log.Logger, db *db.MemoryStore, ocspResponderURL string, alternateRoots int, chainLength int, certificateValidityPeriod uint64) *CAImpl {
+func New(log *log.Logger, db *db.MemoryStore, ocspResponderURL string, alternateRoots int, chainLength int, profiles map[string]Profile) *CAImpl {
 	ca := &CAImpl{
-		log:                log,
-		db:                 db,
-		certValidityPeriod: defaultValidityPeriod,
+		log:      log,
+		db:       db,
+		profiles: make(map[string]*Profile, len(profiles)),
 	}
 
 	if ocspResponderURL != "" {
@@ -363,13 +370,31 @@ func New(log *log.Logger, db *db.MemoryStore, ocspResponderURL string, alternate
 		ca.chains[i] = ca.newChain(intermediateKey, intermediateSubject, subjectKeyID, chainLength)
 	}
 
-	if certificateValidityPeriod != 0 && certificateValidityPeriod < 9223372038 {
-		ca.certValidityPeriod = certificateValidityPeriod
+	for name, prof := range profiles {
+		if prof.ValidityPeriod <= 0 || prof.ValidityPeriod >= 9223372038 {
+			prof.ValidityPeriod = defaultValidityPeriod
+		}
+		ca.profiles[name] = &prof
+		ca.log.Printf("Loaded profile %q with certificate validity period of %d seconds", name, prof.ValidityPeriod)
 	}
 
-	ca.log.Printf("Using certificate validity period of %d seconds", ca.certValidityPeriod)
-
 	return ca
+}
+
+var ocspMustStapleExt = pkix.Extension{
+	Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24},
+	Value: []byte{0x30, 0x03, 0x02, 0x01, 0x05},
+}
+
+// Returns whether the given extensions array contains an OCSP Must-Staple
+// extension.
+func extensionsContainsOCSPMustStaple(extensions []pkix.Extension) bool {
+	for _, ext := range extensions {
+		if ext.Id.Equal(ocspMustStapleExt.Id) && bytes.Equal(ext.Value, ocspMustStapleExt.Value) {
+			return true
+		}
+	}
+	return false
 }
 
 func (ca *CAImpl) CompleteOrder(order *core.Order) {
@@ -396,9 +421,17 @@ func (ca *CAImpl) CompleteOrder(order *core.Order) {
 		authz.RUnlock()
 	}
 
+	// Build a list of approved extensions to include in the certificate
+	var extensions []pkix.Extension
+	if extensionsContainsOCSPMustStaple(order.ParsedCSR.Extensions) {
+		// If the user requested an OCSP Must-Staple extension, use our
+		// pre-baked one to ensure a reasonable value for Critical
+		extensions = append(extensions, ocspMustStapleExt)
+	}
+
 	// issue a certificate for the csr
 	csr := order.ParsedCSR
-	cert, err := ca.newCertificate(csr.DNSNames, csr.IPAddresses, csr.PublicKey, order.AccountID, order.NotBefore, order.NotAfter)
+	cert, err := ca.newCertificate(csr.DNSNames, csr.IPAddresses, csr.PublicKey, order.AccountID, order.NotBefore, order.NotAfter, order.Profile, extensions)
 	if err != nil {
 		ca.log.Printf("Error: unable to issue order: %s", err.Error())
 		return
@@ -409,6 +442,25 @@ func (ca *CAImpl) CompleteOrder(order *core.Order) {
 	order.Lock()
 	order.CertificateObject = cert
 	order.Unlock()
+}
+
+// RecognizedSKID attempts to match the incoming Authority Key Idenfitier (AKID)
+// bytes to the Subject Key Identifier (SKID) of an intermediate certificate. It
+// returns an error if no match is found.
+func (ca *CAImpl) RecognizedSKID(issuer []byte) error {
+	if issuer == nil {
+		return errors.New("issuer bytes must not be nil")
+	}
+
+	for _, chain := range ca.chains {
+		for _, intermediate := range chain.intermediates {
+			if bytes.Equal(intermediate.cert.Cert.SubjectKeyId, issuer) {
+				return nil
+			}
+		}
+	}
+
+	return errors.New("no known issuer matches the provided Authority Key Identifier ")
 }
 
 func (ca *CAImpl) GetNumberOfRootCerts() int {
@@ -443,7 +495,7 @@ func (ca *CAImpl) GetRootKey(no int) *rsa.PrivateKey {
 	return nil
 }
 
-// GetIntermediateCert returns the first (closest the the leaf) issuer certificate
+// GetIntermediateCert returns the first (closest the leaf) issuer certificate
 // in the chain identified by `no`.
 func (ca *CAImpl) GetIntermediateCert(no int) *core.Certificate {
 	chain := ca.getChain(no)
@@ -464,4 +516,12 @@ func (ca *CAImpl) GetIntermediateKey(no int) *rsa.PrivateKey {
 		return key
 	}
 	return nil
+}
+
+func (ca *CAImpl) GetProfiles() map[string]string {
+	res := make(map[string]string, len(ca.profiles))
+	for name, prof := range ca.profiles {
+		res[name] = prof.Description
+	}
+	return res
 }

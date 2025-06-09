@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	"github.com/go-jose/go-jose/v4"
 
 	"github.com/letsencrypt/pebble/v2/acme"
 	"github.com/letsencrypt/pebble/v2/core"
@@ -46,8 +46,11 @@ type MemoryStore struct {
 	// key bytes.
 	accountsByKeyID map[string]*core.Account
 
-	ordersByID        map[string]*core.Order
-	ordersByAccountID map[string][]*core.Order
+	// ordersByIssuedSerial indexes the hex encoding of the certificate's
+	// SerialNumber.
+	ordersByIssuedSerial map[string]*core.Order
+	ordersByID           map[string]*core.Order
+	ordersByAccountID    map[string][]*core.Order
 
 	authorizationsByID map[string]*core.Authorization
 
@@ -66,6 +69,7 @@ func NewMemoryStore() *MemoryStore {
 		accountRand:             rand.New(rand.NewSource(time.Now().UnixNano())),
 		accountsByID:            make(map[string]*core.Account),
 		accountsByKeyID:         make(map[string]*core.Account),
+		ordersByIssuedSerial:    make(map[string]*core.Order),
 		ordersByID:              make(map[string]*core.Order),
 		ordersByAccountID:       make(map[string][]*core.Order),
 		authorizationsByID:      make(map[string]*core.Authorization),
@@ -94,6 +98,28 @@ func (m *MemoryStore) GetAccountByKey(key crypto.PublicKey) (*core.Account, erro
 	return m.accountsByKeyID[keyID], nil
 }
 
+// UpdateReplacedOrder takes a serial and marks a parent order as
+// replaced/not-replaced or returns an error.
+//
+// We intentionally don't Lock the database inside this method because the inner
+// GetOrderByIssuedSerial which is used elsewhere does an RLock which would
+// hang.
+func (m *MemoryStore) UpdateReplacedOrder(serial string, shouldBeReplaced bool) error {
+	if serial == "" {
+		return acme.InternalErrorProblem("no serial provided")
+	}
+
+	originalOrder, err := m.GetOrderByIssuedSerial(serial)
+	if err != nil {
+		return acme.InternalErrorProblem(fmt.Sprintf("could not find an order for the given certificate: %s", err))
+	}
+	originalOrder.Lock()
+	defer originalOrder.Unlock()
+	originalOrder.IsReplaced = shouldBeReplaced
+
+	return nil
+}
+
 // Note that this function should *NOT* be used for key changes. It assumes
 // the public key associated to the account does not change. Use ChangeAccountKey
 // to change the account's public key.
@@ -117,7 +143,7 @@ func (m *MemoryStore) AddAccount(acct *core.Account) (int, error) {
 	defer m.Unlock()
 
 	if acct.Key == nil {
-		return 0, fmt.Errorf("account must not have a nil Key")
+		return 0, errors.New("account must not have a nil Key")
 	}
 
 	keyID, err := keyToID(acct.Key)
@@ -134,7 +160,7 @@ func (m *MemoryStore) AddAccount(acct *core.Account) (int, error) {
 	}
 
 	if _, present := m.accountsByKeyID[keyID]; present {
-		return 0, fmt.Errorf("account with key already exists")
+		return 0, errors.New("account with key already exists")
 	}
 
 	acct.ID = acctID
@@ -177,7 +203,7 @@ func (m *MemoryStore) AddOrder(order *core.Order) (int, error) {
 	accountID := order.AccountID
 	order.RUnlock()
 	if len(orderID) == 0 {
-		return 0, fmt.Errorf("order must have a non-empty ID to add to MemoryStore")
+		return 0, errors.New("order must have a non-empty ID to add to MemoryStore")
 	}
 
 	if _, present := m.ordersByID[orderID]; present {
@@ -195,6 +221,19 @@ func (m *MemoryStore) AddOrder(order *core.Order) (int, error) {
 	return len(m.ordersByID), nil
 }
 
+func (m *MemoryStore) AddOrderByIssuedSerial(order *core.Order) error {
+	m.Lock()
+	defer m.Unlock()
+
+	if order.CertificateObject == nil {
+		return errors.New("order must have non-empty CertificateObject")
+	}
+
+	m.ordersByIssuedSerial[order.CertificateObject.ID] = order
+
+	return nil
+}
+
 func (m *MemoryStore) GetOrderByID(id string) *core.Order {
 	m.RLock()
 	defer m.RUnlock()
@@ -210,6 +249,20 @@ func (m *MemoryStore) GetOrderByID(id string) *core.Order {
 		return order
 	}
 	return nil
+}
+
+// GetOrderByIssuedSerial returns the order that resulted in the given certificate
+// serial. If no such order exists, an error will be returned.
+func (m *MemoryStore) GetOrderByIssuedSerial(serial string) (*core.Order, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	order, ok := m.ordersByIssuedSerial[serial]
+	if !ok {
+		return nil, errors.New("could not find order resulting in the given certificate serial number")
+	}
+
+	return order, nil
 }
 
 func (m *MemoryStore) GetOrdersByAccountID(accountID string) []*core.Order {
@@ -238,7 +291,7 @@ func (m *MemoryStore) AddAuthorization(authz *core.Authorization) (int, error) {
 	authz.RLock()
 	authzID := authz.ID
 	if len(authzID) == 0 {
-		return 0, fmt.Errorf("authz must have a non-empty ID to add to MemoryStore")
+		return 0, errors.New("authz must have a non-empty ID to add to MemoryStore")
 	}
 	authz.RUnlock()
 
@@ -285,7 +338,7 @@ func (m *MemoryStore) AddChallenge(chal *core.Challenge) (int, error) {
 	chalID := chal.ID
 	chal.RUnlock()
 	if len(chalID) == 0 {
-		return 0, fmt.Errorf("challenge must have a non-empty ID to add to MemoryStore")
+		return 0, errors.New("challenge must have a non-empty ID to add to MemoryStore")
 	}
 
 	if _, present := m.challengesByID[chalID]; present {
@@ -308,7 +361,7 @@ func (m *MemoryStore) AddCertificate(cert *core.Certificate) (int, error) {
 
 	certID := cert.ID
 	if len(certID) == 0 {
-		return 0, fmt.Errorf("cert must have a non-empty ID to add to MemoryStore")
+		return 0, errors.New("cert must have a non-empty ID to add to MemoryStore")
 	}
 
 	if _, present := m.certificatesByID[certID]; present {
@@ -360,7 +413,6 @@ func (m *MemoryStore) RevokeCertificate(cert *core.RevokedCertificate) {
 	m.Lock()
 	defer m.Unlock()
 	m.revokedCertificatesByID[cert.Certificate.ID] = cert
-	delete(m.certificatesByID, cert.Certificate.ID)
 }
 
 /*
@@ -372,7 +424,7 @@ func keyToID(key crypto.PublicKey) (string, error) {
 	switch t := key.(type) {
 	case *jose.JSONWebKey:
 		if t == nil {
-			return "", fmt.Errorf("Cannot compute ID of nil key")
+			return "", errors.New("cannot compute ID of nil key")
 		}
 		return keyToID(t.Key)
 	case jose.JSONWebKey:
@@ -426,7 +478,7 @@ func (m *MemoryStore) AddExternalAccountKeyByID(keyID, key string) error {
 
 	keyDecoded, err := base64.RawURLEncoding.DecodeString(key)
 	if err != nil {
-		return fmt.Errorf("failed to decode base64 URL encoded key %q: %s", key, err)
+		return fmt.Errorf("failed to decode base64 URL encoded key %q: %w", key, err)
 	}
 
 	m.Lock()
@@ -495,4 +547,20 @@ func (m *MemoryStore) IsDomainBlocked(name string) bool {
 	}
 
 	return false
+}
+
+// SetARIResponse looks up a certificate by serial number and sets its ARI response field
+func (m *MemoryStore) SetARIResponse(serial *big.Int, ariResponse string) error {
+	m.Lock()
+	defer m.Unlock()
+
+	for _, cert := range m.certificatesByID {
+		if cert.Cert.SerialNumber.Cmp(serial) == 0 {
+			cert.ARIResponse = ariResponse
+			return nil
+		}
+	}
+
+	// Certificate not found
+	return fmt.Errorf("certificate with serial number %s not found", serial.String())
 }

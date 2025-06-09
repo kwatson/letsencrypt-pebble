@@ -5,13 +5,17 @@ import (
 	"crypto"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+
 	"github.com/letsencrypt/pebble/v2/acme"
-	"gopkg.in/square/go-jose.v2"
 )
 
 type Order struct {
@@ -25,6 +29,8 @@ type Order struct {
 	AuthorizationObjects []*Authorization
 	BeganProcessing      bool
 	CertificateObject    *Certificate
+	// Indicates if the finalized order has been successfully replaced via ARI.
+	IsReplaced bool
 }
 
 func (o *Order) GetStatus() (string, error) {
@@ -53,22 +59,15 @@ func (o *Order) GetStatus() (string, error) {
 		}
 	}
 
-	// An order is invalid if **any** of its authzs are invalid
-	if authzStatuses[acme.StatusInvalid] > 0 {
+	// An order is invalid if ANY of its authzs are invalid, deactivated, or
+	// expired per: https://tools.ietf.org/html/rfc8555#page-32
+	if authzStatuses[acme.StatusInvalid] > 0 ||
+		authzStatuses[acme.StatusDeactivated] > 0 ||
+		authzStatuses[acme.StatusExpired] > 0 {
 		return acme.StatusInvalid, nil
 	}
 
-	// An order is expired if **any** of its authzs are expired
-	if authzStatuses[acme.StatusExpired] > 0 {
-		return acme.StatusInvalid, nil
-	}
-
-	// An order is deactivated if **any** of its authzs are deactivated
-	if authzStatuses[acme.StatusDeactivated] > 0 {
-		return acme.StatusDeactivated, nil
-	}
-
-	// An order is pending if **any** of its authzs are pending
+	// Otherwise, an order is pending if ANY of its authzs are pending.
 	if authzStatuses[acme.StatusPending] > 0 {
 		return acme.StatusPending, nil
 	}
@@ -80,8 +79,8 @@ func (o *Order) GetStatus() (string, error) {
 	// early. Somehow we made it this far but also don't have the correct number
 	// of valid authzs.
 	if !fullyAuthorized {
-		return "", fmt.Errorf(
-			"Order has the incorrect number of valid authorizations & no pending, " +
+		return "", errors.New(
+			"order has the incorrect number of valid authorizations & no pending, " +
 				"deactivated or invalid authorizations")
 	}
 
@@ -104,7 +103,7 @@ func (o *Order) GetStatus() (string, error) {
 	}
 
 	// If none of the above cases match something weird & unexpected has happened.
-	return "", fmt.Errorf("Order is in an unknown state")
+	return "", errors.New("order is in an unknown state")
 }
 
 type Account struct {
@@ -150,6 +149,8 @@ type Certificate struct {
 	DER          []byte
 	IssuerChains [][]*Certificate
 	AccountID    string
+	// When non-empty, this is the ARI response sent for this certificate.
+	ARIResponse string
 }
 
 func (c Certificate) PEM() []byte {
@@ -197,4 +198,105 @@ type ValidationRecord struct {
 	URL         string
 	Error       *acme.ProblemDetails
 	ValidatedAt time.Time
+}
+
+// CertID represents a unique identifier (CertID) for a certificate as per the
+// ACME protocol's "renewalInfo" resource, as specified in draft-ietf-acme-ari-
+// 03. The CertID is a composite string derived from the base64url-encoded
+// keyIdentifier of the certificate's Authority Key Identifier (AKI) and the
+// base64url-encoded serial number of the certificate, separated by a period.
+// For more details see:
+// https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari-02#section-4.1.
+type CertID struct {
+	KeyIdentifier []byte
+	SerialNumber  *big.Int
+	// id is the pre-computed hex encoding of SerialNumber.
+	id string
+}
+
+// SerialHex returns a CertID's id field.
+func (c CertID) SerialHex() string {
+	return c.id
+}
+
+// NewCertID takes bytes representing a serial number and authority key
+// identifier and returns a CertID or an error.
+func NewCertID(serial []byte, akid []byte) (*CertID, error) {
+	if serial == nil || akid == nil {
+		return nil, errors.New("must send non-nil bytes")
+	}
+
+	return &CertID{
+		KeyIdentifier: akid,
+		SerialNumber:  new(big.Int).SetBytes(serial),
+		id:            hex.EncodeToString(serial),
+	}, nil
+}
+
+// SuggestedWindow is a type exposed inside the RenewalInfo resource.
+type SuggestedWindow struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// IsWithin returns true if the given time is within the suggested window,
+// inclusive of the start time and exclusive of the end time.
+func (window SuggestedWindow) IsWithin(now time.Time) bool {
+	return !now.Before(window.Start) && now.Before(window.End)
+}
+
+// RenewalInfo is a type which is exposed to clients which query the renewalInfo
+// endpoint specified in draft-aaron-ari.
+type RenewalInfo struct {
+	SuggestedWindow SuggestedWindow `json:"suggestedWindow"`
+}
+
+// RenewalInfoSimple constructs a `RenewalInfo` object and suggested window
+// using a very simple renewal calculation: calculate a point 2/3rds of the way
+// through the validity period, then give a 2-day window around that. Both the
+// `issued` and `expires` timestamps are expected to be UTC.
+func RenewalInfoSimple(issued time.Time, expires time.Time) *RenewalInfo {
+	validity := expires.Add(time.Second).Sub(issued)
+	renewalOffset := validity / time.Duration(3)
+	idealRenewal := expires.Add(-renewalOffset)
+	windowStart := idealRenewal.Add(-24 * time.Hour)
+	windowEnd := idealRenewal.Add(24 * time.Hour)
+
+	// Ensure RenewalWindow is not after the expiry
+	if windowEnd.After(expires) {
+		windowEnd = expires
+	}
+	// Ensure correct start for future issueds
+	if windowStart.Before(issued) {
+		windowStart = issued
+	}
+
+	// draft-ietf-acme-ari states:
+	// A RenewalInfo object in which the end timestamp
+	// equals or precedes the start timestamp is invalid.
+	if !windowStart.Before(windowEnd) {
+		windowStart = windowStart.Add(-1 * time.Second)
+	}
+
+	return &RenewalInfo{
+		SuggestedWindow: SuggestedWindow{
+			Start: windowStart.Truncate(time.Millisecond),
+			End:   windowEnd.Truncate(time.Millisecond),
+		},
+	}
+}
+
+// RenewalInfoImmediate constructs a `RenewalInfo` object with a suggested
+// window in the past. Per the draft-ietf-acme-ari-01 spec, clients should
+// attempt to renew immediately if the suggested window is in the past. The
+// passed `now` is assumed to be a timestamp representing the current moment in
+// time.
+func RenewalInfoImmediate(now time.Time) *RenewalInfo {
+	oneHourAgo := now.Add(-1 * time.Hour)
+	return &RenewalInfo{
+		SuggestedWindow: SuggestedWindow{
+			Start: oneHourAgo.Truncate(time.Millisecond),
+			End:   oneHourAgo.Add(1 * time.Second).Truncate(time.Millisecond),
+		},
+	}
 }

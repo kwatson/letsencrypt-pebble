@@ -2,10 +2,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/letsencrypt/pebble/v2/ca"
 	"github.com/letsencrypt/pebble/v2/cmd"
@@ -13,6 +15,8 @@ import (
 	"github.com/letsencrypt/pebble/v2/va"
 	"github.com/letsencrypt/pebble/v2/wfe"
 )
+
+var version = "dev" // Default value, to be overridden with ldflags
 
 type config struct {
 	Pebble struct {
@@ -28,12 +32,15 @@ type config struct {
 		ExternalAccountMACKeys         map[string]string
 		// Configure policies to deny certain domains
 		DomainBlocklist []string
+		Profiles        map[string]ca.Profile
 
-		CertificateValidityPeriod uint64
 		RetryAfter struct {
 			Authz int
 			Order int
 		}
+
+		// Deprecated: use Profiles.ValidityPeriod instead
+		CertificateValidityPeriod uint64
 	}
 }
 
@@ -50,10 +57,31 @@ func main() {
 		"dnsserver",
 		"",
 		"Define a custom DNS server address (ex: 192.168.0.56:5053 or 8.8.8.8:53).")
+	versionFlag := flag.Bool(
+		"version",
+		false,
+		"Print the software version")
 	flag.Parse()
+
+	if len(flag.Args()) > 0 {
+		fmt.Printf("invalid command line arguments: %s\n", strings.Join(flag.Args(), " "))
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *versionFlag {
+		// Print the version and exit
+		fmt.Printf("Pebble version: %s\n", version)
+		os.Exit(0)
+	}
+
 	if *configFile == "" {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *strictMode {
+		fmt.Printf("Running in strict mode\n")
 	}
 
 	// Log to stdout
@@ -75,9 +103,19 @@ func main() {
 		chainLength = int(val)
 	}
 
+	profiles := c.Pebble.Profiles
+	if len(profiles) == 0 {
+		profiles = map[string]ca.Profile{
+			"default": {
+				Description:    "The default profile",
+				ValidityPeriod: 0, // Will be overridden by the CA's default
+			},
+		}
+	}
+
 	db := db.NewMemoryStore()
-	ca := ca.New(logger, db, c.Pebble.OCSPResponderURL, alternateRoots, chainLength, c.Pebble.CertificateValidityPeriod)
-	va := va.New(logger, c.Pebble.HTTPPort, c.Pebble.TLSPort, *strictMode, *resolverAddress)
+	ca := ca.New(logger, db, c.Pebble.OCSPResponderURL, alternateRoots, chainLength, profiles)
+	va := va.New(logger, c.Pebble.HTTPPort, c.Pebble.TLSPort, *strictMode, *resolverAddress, db)
 
 	for keyID, key := range c.Pebble.ExternalAccountMACKeys {
 		err := db.AddExternalAccountKeyByID(keyID, key)
